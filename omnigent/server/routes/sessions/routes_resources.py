@@ -21,7 +21,7 @@ from fastapi import (
     Request,
     UploadFile,
 )
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from omnigent.entities import (
     Conversation,
@@ -306,6 +306,55 @@ def register_resources_routes(
                 status_code=502, detail="runner resource endpoint returned non-object JSON"
             )
         return cast(dict[str, Any], response_payload)
+
+    async def _proxy_download_from_runner(
+        session_id: str,
+        runner_path: str,
+        conversation: Conversation,
+    ) -> Response:
+        """Proxy a file download from the runner as a binary response.
+
+        Unlike :func:`_proxy_get_to_runner`, this does not parse JSON —
+        it forwards the raw bytes and the runner's Content-Disposition
+        header directly.  Used by the ``?download=1`` path so large
+        workspace files are not truncated by the 10 MiB preview cap.
+
+        :param session_id: Session/conversation identifier.
+        :param runner_path: Runner-relative URL including query string.
+        :param conversation: Conversation loaded during authorization.
+        :returns: Binary response with Content-Disposition: attachment.
+        :raises HTTPException: 502 on transport failure or runner error.
+        """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        try:
+            resp = await runner_client.get(runner_path, timeout=120.0)
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="runner download endpoint unavailable",
+            ) from exc
+        if resp.status_code == 404:
+            raise OmnigentError("File not found", code=ErrorCode.NOT_FOUND)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=502, detail="runner download failed")
+        content_type = resp.headers.get("content-type", "application/octet-stream")
+        content_disposition = resp.headers.get("content-disposition", "attachment")
+        return Response(
+            content=resp.content,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": content_disposition,
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     async def _fs_get_with_host_fallback(
         session_id: str,
@@ -2031,6 +2080,7 @@ def register_resources_routes(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
+        download: bool = Query(default=False),
     ) -> Any:
         """
         Read a file or list a directory in an environment.
@@ -2044,14 +2094,11 @@ def register_resources_routes(
         :param after: Cursor entry id for forward pagination.
         :param before: Cursor entry id for backward pagination.
         :param order: Sort order, ``"asc"`` or ``"desc"``.
+        :param download: When ``True``, stream the complete file without
+            the 10 MiB preview cap and set Content-Disposition: attachment.
+            Ignored for directory listings.
         :returns: File content or directory listing.
         """
-        params: dict[str, str] = {"limit": str(limit), "order": order}
-        if after is not None:
-            params["after"] = after
-        if before is not None:
-            params["before"] = before
-
         # A leading slash means an absolute location rather than a path under
         # the workspace, so it is owner-only: the workspace is the session's
         # shared context, everything past it is the owner's own machine. See
@@ -2062,12 +2109,45 @@ def register_resources_routes(
             session_id, request, _browse_level(relative_path, within_workspace=LEVEL_READ)
         )
 
-        qs = urllib.parse.urlencode(params)
         # Encode only the leading slash: a literal "//" is what proxies
         # collapse, while interior slashes travel fine and keep logs readable.
         runner_rel = (
             "%2F" + urllib.parse.quote(relative_path.lstrip("/")) if absolute else relative_path
         )
+
+        if download:
+            # Download path: bypass the 10 MiB cap; return raw bytes with
+            # Content-Disposition: attachment so the browser saves the file.
+            # The runner streams directly from disk via FileResponse. The host
+            # fallback reads the full file from the workspace on disk.
+            runner_download_path = (
+                f"/v1/sessions/{session_id}/resources/environments"
+                f"/{environment_id}/filesystem/{runner_rel}?download=1"
+            )
+            try:
+                return await _proxy_download_from_runner(session_id, runner_download_path, conv)
+            except OmnigentError as exc:
+                if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                    raise
+            # Runner offline — fall back to the host workspace reader.
+            return await _download_from_host(
+                session_id,
+                conv,
+                path="" if absolute else relative_path,
+                host_workspace_resolver=(
+                    functools.partial(_authorize_absolute_browse, conv, relative_path)
+                    if absolute
+                    else None
+                ),
+            )
+
+        params: dict[str, str] = {"limit": str(limit), "order": order}
+        if after is not None:
+            params["after"] = after
+        if before is not None:
+            params["before"] = before
+
+        qs = urllib.parse.urlencode(params)
         path = (
             f"/v1/sessions/{session_id}/resources/environments"
             f"/{environment_id}/filesystem/{runner_rel}?{qs}"
@@ -2099,6 +2179,62 @@ def register_resources_routes(
                 runner_path=path,
                 host_workspace_resolver=resolver,
             ),
+        )
+
+    async def _download_from_host(
+        session_id: str,
+        conversation: Conversation,
+        path: str,
+        *,
+        host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
+    ) -> Response:
+        """Download a file from the host workspace when the runner is offline.
+
+        Uses :meth:`omnigent.workspace_fs.WorkspaceReader.download_bytes`
+        to read the complete file without the 10 MiB preview cap.
+
+        :param session_id: Session/conversation identifier.
+        :param conversation: Conversation loaded during authorization.
+        :param path: Workspace-relative (or host-absolute) file path.
+        :param host_workspace_resolver: Optional resolver for absolute paths.
+        :returns: Binary response with Content-Disposition: attachment.
+        :raises OmnigentError: RUNNER_UNAVAILABLE when neither runner nor
+            host can serve the download.
+        """
+        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+
+        if host_registry is None or not conversation.host_id or not conversation.workspace:
+            raise OmnigentError(
+                "Session runner is unavailable and no host fallback is configured",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+        host_conn = host_registry.get(conversation.host_id)
+        if host_conn is None:
+            raise OmnigentError(
+                "Session runner is unavailable and host is not connected",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+
+        workspace = conversation.workspace
+        if host_workspace_resolver is not None:
+            workspace = await host_workspace_resolver()
+
+        try:
+            reader = WorkspaceReader(Path(workspace))
+            filename, raw = await asyncio.to_thread(reader.download_bytes, path)
+        except WorkspaceReaderError as exc:
+            if exc.status == 404:
+                raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
+            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
+
+        media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        return Response(
+            content=raw,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @router.put(

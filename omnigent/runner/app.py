@@ -9153,8 +9153,11 @@ def create_runner_app(
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
-    ) -> JSONResponse:
+        download: bool = Query(default=False),
+    ) -> JSONResponse | Response:
         await _require_os_env(session_id)
+        if download:
+            return await _fs_download(session_id, environment_id, relative_path)
         return await _fs_list_or_read(
             session_id,
             environment_id,
@@ -9163,6 +9166,42 @@ def create_runner_app(
             after=after,
             before=before,
             order=order,
+        )
+
+    async def _fs_download(
+        session_id: str,
+        environment_id: str,
+        path: str,
+    ) -> Response:
+        """Stream a workspace file to the client without a size cap.
+
+        Uses FileResponse so the file is sent directly from disk without
+        loading it into memory, which keeps large-file downloads safe.
+        The 10 MiB preview cap in ``_fs_list_or_read`` / ``CallerProcessFilesystem.read``
+        intentionally does not apply here: the caller requested a full download.
+        """
+        from fastapi.responses import FileResponse
+
+        from omnigent.runner.environment_filesystem import CallerProcessFilesystem
+
+        agent_spec = await _resolve_session_agent_spec(session_id)
+        env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
+        fs = CallerProcessFilesystem(env)
+        resolved = fs._resolve(path)
+        if not resolved.exists():
+            raise HTTPException(status_code=404, detail=f"Path {path!r} not found")
+        if not resolved.is_file():
+            raise HTTPException(status_code=400, detail=f"Path {path!r} is not a file")
+        media_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+        filename = resolved.name
+        return FileResponse(
+            str(resolved),
+            media_type=media_type,
+            filename=filename,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Content-Type-Options": "nosniff",
+            },
         )
 
     @app.put(

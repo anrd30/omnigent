@@ -297,6 +297,30 @@ class WorkspaceReader:
             payload["content"] = base64.b64encode(capped).decode()
         return payload
 
+    def download_bytes(self, path: str) -> tuple[str, bytes]:
+        """Return ``(filename, raw_bytes)`` for a full file download.
+
+        Unlike :meth:`_read_file`, this imposes no size cap so the caller
+        receives the complete file regardless of size.  Only use this on
+        the download path — the preview/read path deliberately caps at
+        ``_MAX_READ_BYTES`` to avoid OOM on multi-GB files opened in the
+        viewer.
+
+        :param path: Relative path within the workspace.
+        :returns: ``(filename, raw_bytes)`` of the complete file.
+        :raises WorkspaceReaderError: 400 when path is not a file, 404
+            when the path does not exist.
+        """
+        resolved = self._resolve(path)
+        if not resolved.exists():
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
+        if not resolved.is_file():
+            raise WorkspaceReaderError(400, "not_a_file", f"Path {path!r} is not a file")
+        try:
+            return resolved.name, resolved.read_bytes()
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc
+
     # ── Search ─────────────────────────────────────────────────────
 
     def search(
