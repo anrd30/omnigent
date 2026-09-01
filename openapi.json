@@ -12225,6 +12225,16 @@
               "title": "Order",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "download",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Download",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
