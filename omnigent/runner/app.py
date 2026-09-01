@@ -9154,7 +9154,7 @@ def create_runner_app(
         before: str | None = Query(default=None),
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         download: bool = Query(default=False),
-    ) -> JSONResponse | Response:
+    ) -> Response:
         await _require_os_env(session_id)
         if download:
             return await _fs_download(session_id, environment_id, relative_path)
