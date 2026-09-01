@@ -12227,6 +12227,7 @@
             }
           },
           {
+            "description": "When `True`, stream the complete file without the 10 MiB preview cap and set Content-Disposition: attachment. Ignored for directory listings.",
             "in": "query",
             "name": "download",
             "required": false,
