@@ -308,9 +308,8 @@ def register_resources_routes(
         return cast(dict[str, Any], response_payload)
 
     async def _proxy_download_from_runner(
-        session_id: str,
+        runner_client: Any,
         runner_path: str,
-        conversation: Conversation,
     ) -> Response:
         """Proxy a file download from the runner as a binary response.
 
@@ -319,21 +318,11 @@ def register_resources_routes(
         header directly.  Used by the ``?download=1`` path so large
         workspace files are not truncated by the 10 MiB preview cap.
 
-        :param session_id: Session/conversation identifier.
+        :param runner_client: Authenticated HTTP client for the runner.
         :param runner_path: Runner-relative URL including query string.
-        :param conversation: Conversation loaded during authorization.
         :returns: Binary response with Content-Disposition: attachment.
         :raises HTTPException: 502 on transport failure or runner error.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
-        if runner_client is None:
-            raise HTTPException(
-                status_code=502,
-                detail="no runner available for resource access",
-            )
         try:
             resp = await runner_client.get(runner_path, timeout=120.0)
         except (httpx.HTTPError, ConnectionError) as exc:
@@ -2124,11 +2113,15 @@ def register_resources_routes(
                 f"/v1/sessions/{session_id}/resources/environments"
                 f"/{environment_id}/filesystem/{runner_rel}?download=1"
             )
-            try:
-                return await _proxy_download_from_runner(session_id, runner_download_path, conv)
-            except OmnigentError as exc:
-                if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                    raise
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id, conversation=conv
+            )
+            if runner_client is not None:
+                try:
+                    return await _proxy_download_from_runner(runner_client, runner_download_path)
+                except OmnigentError as exc:
+                    if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                        raise
             # Runner offline — fall back to the host workspace reader.
             return await _download_from_host(
                 session_id,
