@@ -496,6 +496,90 @@ async def test_read_nonexistent_file_returns_404(
 
 
 @pytest.mark.asyncio
+async def test_download_returns_full_file_past_read_caps(
+    workspace: Path,
+    client: httpx.AsyncClient,
+) -> None:
+    """``?download=1`` returns the COMPLETE file as a raw attachment.
+
+    The plain read caps text files at the default line limit, so a file
+    past that cap comes back ``truncated: true`` and the JSON payload
+    loses the tail. The download mode must bypass the caps and deliver
+    every byte, or "Download file" silently saves an incomplete file.
+    """
+    lines = 3000  # beyond the 2000-line default read cap
+    content = "".join(f"line {i}\n" for i in range(1, lines + 1))
+    (workspace / "big.txt").write_text(content)
+
+    read_resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/big.txt"
+    )
+    assert read_resp.status_code == 200
+    assert read_resp.json()["truncated"] is True  # the preview IS capped
+
+    dl_resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/big.txt?download=1"
+    )
+    assert dl_resp.status_code == 200
+    assert dl_resp.content.decode("utf-8") == content
+    assert "attachment" in dl_resp.headers["content-disposition"]
+    assert 'filename="big.txt"' in dl_resp.headers["content-disposition"]
+
+
+@pytest.mark.asyncio
+async def test_download_binary_round_trips_verbatim(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?download=1`` on a binary file returns its exact bytes."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/logo.png?download=1"
+    )
+    assert resp.status_code == 200
+    assert resp.content == b"\x89PNG\r\n\x1a\n\x00\x01\x02\xff"
+    assert resp.headers["content-type"] == "image/png"
+
+
+@pytest.mark.asyncio
+async def test_download_missing_file_returns_404(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?download=1`` on a missing path is a 404, not an empty file."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/nope.bin?download=1"
+    )
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_download_directory_returns_400(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?download=1`` on a directory is rejected."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/src?download=1"
+    )
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_download_path_traversal_rejected(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?download=1`` goes through the same path confinement as reads."""
+    resp = await client.get(
+        f"/v1/sessions/conv_test/resources/environments"
+        f"/{DEFAULT_ENVIRONMENT_ID}/filesystem/" + "..%2F..%2Fetc%2Fpasswd?download=1"
+    )
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "invalid_path"
+
+
+@pytest.mark.asyncio
 async def test_filesystem_session_without_agent_id_returns_typed_404(
     registry: SessionResourceRegistry,
 ) -> None:

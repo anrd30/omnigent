@@ -1,8 +1,9 @@
-"""Tests for WorkspaceReader.download_bytes (fix for issue #5793).
+"""Tests for WorkspaceReader.download_bytes.
 
-The 10 MiB cap in _read_file / _MAX_READ_BYTES is intentional for the
+The byte cap in _read_file / _MAX_READ_BYTES is intentional for the
 preview/viewer path.  download_bytes must bypass it so "Download file"
-returns the complete file.
+returns the complete file, while still honoring an explicit transport
+cap (``max_bytes``) for framed carriers like the host tunnel.
 """
 
 from __future__ import annotations
@@ -86,4 +87,32 @@ def test_download_bytes_binary_file_intact(tmp_path):
     name, data = reader.download_bytes("data.bin")
 
     assert name == "data.bin"
+    assert data == content
+
+
+def test_download_bytes_transport_cap_rejects_oversize(tmp_path):
+    """An explicit ``max_bytes`` rejects an oversize file with 413.
+
+    Framed transports (the host tunnel) cannot carry arbitrarily large
+    payloads; the cap must be checked against the on-disk size so the
+    file is never read into memory first.
+    """
+    f = tmp_path / "big.bin"
+    f.write_bytes(b"A" * 100)
+
+    reader = _make_workspace(tmp_path)
+    with pytest.raises(WorkspaceReaderError) as exc_info:
+        reader.download_bytes("big.bin", max_bytes=99)
+    assert exc_info.value.status == 413
+    assert exc_info.value.code == "too_large"
+
+
+def test_download_bytes_transport_cap_allows_exact_size(tmp_path):
+    content = b"B" * 100
+    f = tmp_path / "fits.bin"
+    f.write_bytes(content)
+
+    reader = _make_workspace(tmp_path)
+    name, data = reader.download_bytes("fits.bin", max_bytes=100)
+    assert name == "fits.bin"
     assert data == content

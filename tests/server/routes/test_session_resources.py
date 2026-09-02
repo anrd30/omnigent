@@ -361,6 +361,27 @@ class _FakeRunnerClient:
         self.get_params.append(params)
         return self._make_response("GET", url)
 
+    def build_request(self, method: str, url: str, *, timeout: object = None) -> httpx.Request:
+        """Build a request for the streamed-send path (download proxy).
+
+        :param method: HTTP method, e.g. ``"GET"``.
+        :param url: Request URL path including query string.
+        :param timeout: Request timeout (ignored).
+        :returns: The httpx request.
+        """
+        del timeout
+        return httpx.Request(method, url)
+
+    async def send(self, request: httpx.Request, *, stream: bool = False) -> httpx.Response:
+        """Answer a streamed send with the same canned-response lookup.
+
+        :param request: Request built by :meth:`build_request`.
+        :param stream: Streaming flag (ignored — canned bodies are in memory).
+        :returns: The canned response.
+        """
+        del stream
+        return self._make_response(request.method, str(request.url))
+
     async def post(
         self,
         url: str,
@@ -5292,6 +5313,18 @@ class _OfflineRunnerClient:
         del params, timeout
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
+    def build_request(self, method: str, url: str, *, timeout: object = None) -> httpx.Request:
+        """Build a request; the failure surfaces on :meth:`send`."""
+        del timeout
+        return httpx.Request(method, url)
+
+    async def send(self, request: httpx.Request, *, stream: bool = False) -> Any:
+        """Raise the offline error the tunnel client raises."""
+        del stream
+        raise OmnigentError(
+            f"runner is not connected ({request.url})", code=ErrorCode.RUNNER_UNAVAILABLE
+        )
+
 
 @pytest.fixture
 def offline_env_app(
@@ -5383,6 +5416,168 @@ async def test_offline_environment_advertises_the_same_reach_as_the_runner(
         "unconfined": True,
         "roots": [{"path": _OFFLINE_WORKSPACE, "access": "write", "origin": "cwd"}],
     }
+
+
+# ── Full-file download proxy (?download=1) ──────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_relays_runner_bytes_verbatim(
+    client: httpx.AsyncClient,
+) -> None:
+    """``?download=1`` relays the runner's raw attachment bytes unchanged.
+
+    The plain read path parses JSON and inherits the preview caps; the
+    download path must forward the body and Content-Disposition as-is so
+    large files survive intact.
+    """
+    body = "line data\n" * 5000
+    url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+        "/environments/default/filesystem/big.txt?download=1"
+    )
+    fake_runner = _FakeRunnerClient(
+        text_responses={
+            url: (
+                200,
+                body,
+                {
+                    "content-type": "text/plain",
+                    "content-disposition": 'attachment; filename="big.txt"',
+                },
+            )
+        }
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(url)
+
+    assert resp.status_code == 200
+    assert resp.text == body
+    assert resp.headers["content-disposition"] == 'attachment; filename="big.txt"'
+    assert resp.headers["content-type"].startswith("text/plain")
+    # The proxy hit the runner's download mode, not the capped JSON read.
+    assert fake_runner.calls == [("GET", url)]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_maps_runner_404(
+    client: httpx.AsyncClient,
+) -> None:
+    """A live runner's 404 surfaces as NOT_FOUND, not a hollow download."""
+    url = (
+        "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources"
+        "/environments/default/filesystem/nope.txt?download=1"
+    )
+    fake_runner = _FakeRunnerClient(
+        responses={url: (404, {"detail": "Path 'nope.txt' not found"})}
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(url)
+
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_offline_falls_back_to_host_tunnel(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Runner offline → the download is served over the HOST tunnel.
+
+    The workspace lives on the host machine, not the server, so the
+    fallback must send a ``download`` fs op over the host tunnel (like
+    every other offline filesystem read) and decode the base64 payload
+    the host returns — never read the server's local disk.
+    """
+    import base64
+
+    from omnigent.server.routes.sessions import routes_resources as _routes
+
+    raw = b"complete file bytes \x00\x01 past any preview cap"
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    async def _fake_host_read(
+        host_registry: Any,
+        host_conn: Any,
+        *,
+        op: str = "",
+        workspace: str = "",
+        session_id: str = "",
+        params: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        del host_registry, host_conn, session_id, kwargs
+        seen.append((op, {"workspace": workspace, **(params or {})}))
+        return {
+            "object": "session.environment.filesystem.download",
+            "filename": "report.bin",
+            "bytes": len(raw),
+            "content": base64.b64encode(raw).decode(),
+        }
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._host_filesystem.read_workspace_from_host",
+        _fake_host_read,
+    )
+    del _routes  # imported for the lazy-import target above
+
+    resp = await offline_env_client.get(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources"
+        "/environments/default/filesystem/report.bin?download=1"
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == raw
+    assert 'filename="report.bin"' in resp.headers["content-disposition"]
+    assert seen == [("download", {"workspace": _OFFLINE_WORKSPACE, "path": "report.bin"})]
+
+
+@pytest.mark.asyncio
+async def test_filesystem_download_offline_without_host_returns_503(
+    runner_globals_reset: None,
+) -> None:
+    """Runner offline and no host bound → the original offline error (503)."""
+    del runner_globals_reset
+    conv = Conversation(
+        id=_OFFLINE_SESSION,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=_OFFLINE_SESSION,
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        # No host_id / workspace: nothing to fall back to.
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+
+    application = FastAPI()
+
+    @application.exception_handler(OmnigentError)
+    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
+        del request
+        return JSONResponse(
+            status_code=exc.http_status,
+            content={"error": {"code": exc.code, "message": exc.message}},
+        )
+
+    from types import SimpleNamespace
+
+    application.include_router(
+        create_sessions_router(
+            SimpleNamespace(get_conversation=lambda _sid: conv),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+        ),
+        prefix="/v1",
+    )
+    transport = httpx.ASGITransport(app=application)
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        resp = await c.get(
+            f"/v1/sessions/{_OFFLINE_SESSION}/resources"
+            "/environments/default/filesystem/report.bin?download=1"
+        )
+
+    assert resp.status_code == 503
+    assert resp.json()["error"]["code"] == ErrorCode.RUNNER_UNAVAILABLE
 
 
 # ── Workspace-file gzip (GZipFileContentRoute) ───────────────────

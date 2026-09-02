@@ -92,23 +92,27 @@ export function triggerBrowserDownload(blob: Blob, filename: string): void {
 }
 
 /**
- * Fetch a workspace file and trigger a browser download of its contents.
+ * Fetch a workspace file in full and trigger a browser download.
  *
- * Logs a console warning when the server indicates the file was truncated
- * (``truncated: true``) so callers know the downloaded content may be
- * incomplete.
+ * Uses the filesystem endpoint's ``download=1`` mode, which streams the
+ * complete file as raw bytes with no preview cap — unlike the viewer's
+ * JSON read, which truncates large files. The response body is saved
+ * verbatim, so the download never loses content past the preview cap.
  *
  * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
-  const data = await fetchFileContent(conversationId, path);
-  if (data.truncated) {
-    console.warn(
-      `[web] File "${path}" was truncated by the server — downloaded content may be incomplete.`,
-    );
-  }
-  triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
+  const encodedPath = browseLocationSegment(path);
+  const base = browseLocationBase(path);
+  const url =
+    `/v1/sessions/${encodeURIComponent(conversationId)}` +
+    `/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem/${encodedPath}` +
+    `?download=1` +
+    (base ? `&base=${base}` : "");
+  const res = await authenticatedFetch(url);
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  triggerBrowserDownload(await res.blob(), path.split("/").pop() ?? path);
 }
 
 /**

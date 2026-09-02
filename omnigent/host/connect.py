@@ -406,6 +406,12 @@ _SILENT_CONNECT_ESCALATE_ATTEMPTS = 10
 # Capability discovery is advisory and must not delay the host channel forever.
 _HOST_CAPABILITY_INIT_TIMEOUT_S = 15.0
 
+# Raw-byte cap for a host-served file download. The result travels base64
+# (4/3 expansion) inside a single tunnel frame, and the WebSocket message
+# limit on both ends is 100 MiB — 64 MiB raw leaves comfortable headroom
+# for the frame's JSON envelope.
+_MAX_TUNNEL_DOWNLOAD_BYTES = 64 * 1024 * 1024
+
 # Host-environment variables a spawned runner is allowed to inherit.
 # Deliberately an allowlist (not ``{**os.environ}``): the host runs as the
 # user, so its environment holds the user's personal secrets (API keys,
@@ -2822,6 +2828,19 @@ class HostProcess:
                 exclude=cast("str | None", params.get("exclude")),
                 limit=_coerce_int(params.get("limit", 500)),
             )
+        if op == "download":
+            import base64
+
+            filename, raw = r.download_bytes(
+                str(params.get("path", "")),
+                max_bytes=_MAX_TUNNEL_DOWNLOAD_BYTES,
+            )
+            return {
+                "object": "session.environment.filesystem.download",
+                "filename": filename,
+                "bytes": len(raw),
+                "content": base64.b64encode(raw).decode(),
+            }
         raise ValueError(f"unknown fs op: {op!r}")
 
     async def _handle_create_worktree(

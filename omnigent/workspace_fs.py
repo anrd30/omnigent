@@ -297,19 +297,24 @@ class WorkspaceReader:
             payload["content"] = base64.b64encode(capped).decode()
         return payload
 
-    def download_bytes(self, path: str) -> tuple[str, bytes]:
+    def download_bytes(self, path: str, *, max_bytes: int | None = None) -> tuple[str, bytes]:
         """Return ``(filename, raw_bytes)`` for a full file download.
 
-        Unlike :meth:`_read_file`, this imposes no size cap so the caller
-        receives the complete file regardless of size.  Only use this on
-        the download path — the preview/read path deliberately caps at
-        ``_MAX_READ_BYTES`` to avoid OOM on multi-GB files opened in the
+        Unlike :meth:`_read_file`, this imposes no size cap by default so
+        the caller receives the complete file regardless of size.  Only use
+        this on the download path — the preview/read path deliberately caps
+        at ``_MAX_READ_BYTES`` to avoid OOM on multi-GB files opened in the
         viewer.
 
         :param path: Relative path within the workspace.
+        :param max_bytes: Optional hard cap for transports that cannot carry
+            arbitrarily large payloads (e.g. the host tunnel's framed
+            messages). Checked against the on-disk size *before* reading, so
+            an oversize file never gets slurped into memory first.
         :returns: ``(filename, raw_bytes)`` of the complete file.
         :raises WorkspaceReaderError: 400 when path is not a file, 404
-            when the path does not exist.
+            when the path does not exist, 413 when the file exceeds
+            ``max_bytes``.
         """
         resolved = self._resolve(path)
         if not resolved.exists():
@@ -317,6 +322,12 @@ class WorkspaceReader:
         if not resolved.is_file():
             raise WorkspaceReaderError(400, "not_a_file", f"Path {path!r} is not a file")
         try:
+            if max_bytes is not None and resolved.stat().st_size > max_bytes:
+                raise WorkspaceReaderError(
+                    413,
+                    "too_large",
+                    f"File {path!r} exceeds the {max_bytes}-byte cap for this transport",
+                )
             return resolved.name, resolved.read_bytes()
         except OSError as exc:
             raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc

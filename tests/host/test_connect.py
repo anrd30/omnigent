@@ -5192,3 +5192,85 @@ async def test_handle_import_local_reports_unreadable_sessions_as_failed(
     assert [f.session.external_session_id for f in session_frames] == ["good"]
     assert len(done_frames) == 1
     assert done_frames[0].status == "ok" and done_frames[0].failed == 1
+
+
+# ── Host-served filesystem download op ───────────────────────────────────────
+
+
+def test_fs_request_download_returns_full_file_base64(tmp_path: Path) -> None:
+    """The host's ``download`` fs op returns the complete file, base64-encoded.
+
+    The runner-offline download fallback rides the host tunnel; the host
+    reads the file from ITS disk in full (past the viewer's preview cap)
+    and returns it in the result frame.
+    """
+    import base64
+
+    from omnigent.host.frames import HostFsRequestFrame
+
+    content = b"\x00\x01binary and text mixed\n" * 4096  # ~92 KiB
+    (tmp_path / "artifact.bin").write_bytes(content)
+    host = _make_host_process()
+
+    result = host._handle_fs_request(
+        HostFsRequestFrame(
+            request_id="req_dl",
+            op="download",
+            workspace=str(tmp_path),
+            session_id="conv_dl",
+            params={"path": "artifact.bin"},
+        )
+    )
+
+    assert result.status == "ok", result.error
+    assert result.payload is not None
+    assert result.payload["filename"] == "artifact.bin"
+    assert result.payload["bytes"] == len(content)
+    assert base64.b64decode(str(result.payload["content"])) == content
+
+
+def test_fs_request_download_missing_file_maps_404(tmp_path: Path) -> None:
+    """A missing path comes back as the runner-shaped 404 error frame."""
+    from omnigent.host.frames import HostFsRequestFrame
+
+    host = _make_host_process()
+
+    result = host._handle_fs_request(
+        HostFsRequestFrame(
+            request_id="req_missing",
+            op="download",
+            workspace=str(tmp_path),
+            session_id="conv_dl",
+            params={"path": "nope.bin"},
+        )
+    )
+
+    assert result.status == "error"
+    assert result.error_status == 404
+    assert result.error_code == "not_found"
+
+
+def test_fs_request_download_oversize_maps_413(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file past the tunnel cap is refused with 413, never half-sent."""
+    import omnigent.host.connect as connect_mod
+    from omnigent.host.frames import HostFsRequestFrame
+
+    monkeypatch.setattr(connect_mod, "_MAX_TUNNEL_DOWNLOAD_BYTES", 16)
+    (tmp_path / "huge.bin").write_bytes(b"Z" * 64)
+    host = _make_host_process()
+
+    result = host._handle_fs_request(
+        HostFsRequestFrame(
+            request_id="req_huge",
+            op="download",
+            workspace=str(tmp_path),
+            session_id="conv_dl",
+            params={"path": "huge.bin"},
+        )
+    )
+
+    assert result.status == "error"
+    assert result.error_status == 413
+    assert result.error_code == "too_large"

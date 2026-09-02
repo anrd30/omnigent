@@ -9177,31 +9177,35 @@ def create_runner_app(
 
         Uses FileResponse so the file is sent directly from disk without
         loading it into memory, which keeps large-file downloads safe.
-        The 10 MiB preview cap in ``_fs_list_or_read`` / ``CallerProcessFilesystem.read``
-        intentionally does not apply here: the caller requested a full download.
+        The preview caps in ``_fs_list_or_read`` /
+        ``CallerProcessFilesystem.read`` intentionally do not apply here:
+        the caller requested the complete file.
         """
         from fastapi.responses import FileResponse
 
         from omnigent.runner.environment_filesystem import CallerProcessFilesystem
 
+        await _ensure_session_registered(session_id)
         agent_spec = await _resolve_session_agent_spec(session_id)
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env)
+        # Same resolution as the read path: relative paths are confined to
+        # the environment root, absolute paths go through browse
+        # authorization. InvalidPath/PathUnreachable map via the app's
+        # ResourceError handler (400/403), matching the read endpoints.
         resolved = fs._resolve(path)
         if not resolved.exists():
             raise HTTPException(status_code=404, detail=f"Path {path!r} not found")
         if not resolved.is_file():
             raise HTTPException(status_code=400, detail=f"Path {path!r} is not a file")
         media_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
-        filename = resolved.name
+        # FileResponse's ``filename=`` builds a correctly escaped
+        # Content-Disposition: attachment header (RFC 5987 for non-ASCII).
         return FileResponse(
             str(resolved),
             media_type=media_type,
-            filename=filename,
-            headers={
-                "Content-Disposition": f'attachment; filename="{filename}"',
-                "X-Content-Type-Options": "nosniff",
-            },
+            filename=resolved.name,
+            headers={"X-Content-Type-Options": "nosniff"},
         )
 
     @app.put(

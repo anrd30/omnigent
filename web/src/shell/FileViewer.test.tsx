@@ -103,6 +103,7 @@ vi.mock("@/hooks/useComments", () => ({
 
 vi.mock("@/hooks/useFileContent", () => ({
   useFileContent: vi.fn(() => ({ data: { content: "", path: "file1.py" } })),
+  downloadWorkspaceFile: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("@/hooks/useFileDiff", () => ({

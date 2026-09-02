@@ -67,7 +67,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { fileContentToBlob, triggerBrowserDownload, useFileContent } from "@/hooks/useFileContent";
+import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import {
   type Comment,
@@ -490,10 +490,14 @@ function FileViewerBody({
   );
 
   const downloadFile = useCallback(() => {
-    const data = fileQuery.data;
-    if (!data) return;
-    triggerBrowserDownload(fileContentToBlob(data), path.split("/").pop() ?? path);
-  }, [fileQuery.data, path]);
+    // Always re-fetch through the uncapped download endpoint rather than
+    // saving the viewer's payload: the viewer read is truncated for large
+    // files, and its own banner points users at Download for the full
+    // content. There is no toast surface here, so log failures.
+    downloadWorkspaceFile(conversationId, path).catch((err) =>
+      console.warn(`Download of "${path}" failed`, err),
+    );
+  }, [conversationId, path]);
 
   // Pop the HTML artifact into its own browser tab. The artifact is rendered in
   // a sandboxed, opaque-origin iframe (see `openHtmlArtifactInNewTab`), so it
@@ -996,9 +1000,9 @@ function FileViewerBody({
     settingsMenu.push({
       key: "download",
       label: "Download file",
-      tooltip: fileQuery.data.truncated
-        ? "Download (file was truncated — content may be incomplete)"
-        : "Download",
+      // The download endpoint streams the complete file even when the
+      // viewer shows a truncated preview.
+      tooltip: fileQuery.data.truncated ? "Download the complete file" : "Download",
       icon: <DownloadIcon className="size-4" />,
       active: false,
       onSelect: downloadFile,

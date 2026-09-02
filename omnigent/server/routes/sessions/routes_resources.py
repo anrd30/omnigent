@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import mimetypes
 import ntpath
 import urllib.parse
@@ -22,6 +23,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.responses import Response, StreamingResponse
+from starlette.background import BackgroundTask
 
 from omnigent.entities import (
     Conversation,
@@ -308,41 +310,84 @@ def register_resources_routes(
         return cast(dict[str, Any], response_payload)
 
     async def _proxy_download_from_runner(
-        runner_client: Any,
+        session_id: str,
         runner_path: str,
+        conversation: Conversation,
     ) -> Response:
-        """Proxy a file download from the runner as a binary response.
+        """Proxy a file download from the runner as a streamed binary response.
 
-        Unlike :func:`_proxy_get_to_runner`, this does not parse JSON —
-        it forwards the raw bytes and the runner's Content-Disposition
-        header directly.  Used by the ``?download=1`` path so large
-        workspace files are not truncated by the 10 MiB preview cap.
+        Unlike :func:`_proxy_get_to_runner`, this does not parse JSON — it
+        relays the body bytes as they arrive and forwards the runner's
+        Content-Disposition header directly. Used by the ``?download=1``
+        path so large workspace files are neither truncated by the 10 MiB
+        preview cap nor buffered whole in server memory.
 
-        :param runner_client: Authenticated HTTP client for the runner.
+        :param session_id: Session/conversation identifier.
         :param runner_path: Runner-relative URL including query string.
-        :returns: Binary response with Content-Disposition: attachment.
-        :raises HTTPException: 502 on transport failure or runner error.
+        :param conversation: Conversation loaded during authorization.
+        :returns: Streamed binary response with Content-Disposition: attachment.
+        :raises OmnigentError: Runner-offline / not-found, for the caller's
+            host fallback and the standard error mapping respectively.
+        :raises HTTPException: 502 on transport failure, 400/502 on runner
+            errors.
         """
+        runner_client = await _get_runner_client_for_resource_access(
+            session_id,
+            conversation=conversation,
+        )
+        if runner_client is None:
+            raise HTTPException(
+                status_code=502,
+                detail="no runner available for resource access",
+            )
+        request = runner_client.build_request(
+            "GET",
+            runner_path,
+            # No read deadline: a large file may take arbitrarily long to
+            # stream, and the per-chunk arrival is what read timeouts gate.
+            timeout=httpx.Timeout(30.0, read=None),
+        )
         try:
-            resp = await runner_client.get(runner_path, timeout=120.0)
+            resp = await runner_client.send(request, stream=True)
         except (httpx.HTTPError, ConnectionError) as exc:
             raise HTTPException(
                 status_code=502,
                 detail="runner download endpoint unavailable",
             ) from exc
-        if resp.status_code == 404:
-            raise OmnigentError("File not found", code=ErrorCode.NOT_FOUND)
         if resp.status_code != 200:
-            raise HTTPException(status_code=502, detail="runner download failed")
-        content_type = resp.headers.get("content-type", "application/octet-stream")
-        content_disposition = resp.headers.get("content-disposition", "attachment")
-        return Response(
-            content=resp.content,
-            media_type=content_type,
-            headers={
-                "Content-Disposition": content_disposition,
-                "X-Content-Type-Options": "nosniff",
-            },
+            detail = "runner download failed"
+            try:
+                body = await resp.aread()
+                error_payload = json.loads(body.decode("utf-8"))
+                if isinstance(error_payload, dict):
+                    # FastAPI HTTPException shape and the runner's
+                    # ResourceError handler shape, respectively.
+                    if isinstance(error_payload.get("detail"), str):
+                        detail = error_payload["detail"]
+                    elif isinstance(error_payload.get("error"), dict) and isinstance(
+                        error_payload["error"].get("message"), str
+                    ):
+                        detail = error_payload["error"]["message"]
+            except (ValueError, UnicodeDecodeError):
+                pass
+            finally:
+                await resp.aclose()
+            if resp.status_code == 404:
+                raise OmnigentError(detail, code=ErrorCode.NOT_FOUND)
+            if resp.status_code == 400:
+                raise HTTPException(status_code=400, detail=detail)
+            raise HTTPException(status_code=502, detail=detail)
+        headers = {
+            "Content-Disposition": resp.headers.get("content-disposition", "attachment"),
+            "X-Content-Type-Options": "nosniff",
+        }
+        if resp.headers.get("content-length"):
+            headers["Content-Length"] = resp.headers["content-length"]
+        return StreamingResponse(
+            resp.aiter_bytes(),
+            media_type=resp.headers.get("content-type", "application/octet-stream"),
+            headers=headers,
+            background=BackgroundTask(resp.aclose),
         )
 
     async def _fs_get_with_host_fallback(
@@ -2105,28 +2150,33 @@ def register_resources_routes(
         )
 
         if download:
-            # Download path: bypass the 10 MiB cap; return raw bytes with
-            # Content-Disposition: attachment so the browser saves the file.
-            # The runner streams directly from disk via FileResponse. The host
-            # fallback reads the full file from the workspace on disk.
+            # Download path: bypass the 10 MiB preview cap; return raw bytes
+            # with Content-Disposition: attachment so the browser saves the
+            # complete file. The runner streams it straight from disk; when
+            # the runner is offline the host serves the bytes over its tunnel,
+            # like every other offline filesystem read.
+            #
+            # Opt out of this route's gzip: compressing an arbitrary (often
+            # already-compressed) attachment wastes event-loop time and
+            # drops the Content-Length the browser uses for save progress.
+            skip_gzip(request)
             runner_download_path = (
                 f"/v1/sessions/{session_id}/resources/environments"
                 f"/{environment_id}/filesystem/{runner_rel}?download=1"
             )
-            runner_client = await _get_runner_client_for_resource_access(
-                session_id, conversation=conv
-            )
-            if runner_client is not None:
-                try:
-                    return await _proxy_download_from_runner(runner_client, runner_download_path)
-                except OmnigentError as exc:
-                    if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
-                        raise
-            # Runner offline — fall back to the host workspace reader.
+            try:
+                return await _proxy_download_from_runner(session_id, runner_download_path, conv)
+            except OmnigentError as exc:
+                # Only the runner-offline case falls back to the host; a real
+                # 404 from a live runner must surface unchanged.
+                if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                    raise
+                runner_offline = exc
             return await _download_from_host(
                 session_id,
                 conv,
                 path="" if absolute else relative_path,
+                runner_offline=runner_offline,
                 host_workspace_resolver=(
                     functools.partial(_authorize_absolute_browse, conv, relative_path)
                     if absolute
@@ -2179,47 +2229,51 @@ def register_resources_routes(
         conversation: Conversation,
         path: str,
         *,
+        runner_offline: OmnigentError,
         host_workspace_resolver: Callable[[], Awaitable[str]] | None = None,
     ) -> Response:
-        """Download a file from the host workspace when the runner is offline.
+        """Download a file over the host tunnel when the runner is offline.
 
-        Uses :meth:`omnigent.workspace_fs.WorkspaceReader.download_bytes`
-        to read the complete file without the 10 MiB preview cap.
+        Sends a ``download`` fs op over the session's host tunnel — the
+        host reads the complete file from the workspace on ITS disk (the
+        server never has the workspace locally) and returns it
+        base64-encoded in the result frame, bypassing the 10 MiB preview
+        cap up to the tunnel's own message limit.
 
         :param session_id: Session/conversation identifier.
         :param conversation: Conversation loaded during authorization.
         :param path: Workspace-relative (or host-absolute) file path.
+        :param runner_offline: The runner-offline error to re-raise when
+            the host cannot serve the download either.
         :param host_workspace_resolver: Optional resolver for absolute paths.
         :returns: Binary response with Content-Disposition: attachment.
-        :raises OmnigentError: RUNNER_UNAVAILABLE when neither runner nor
-            host can serve the download.
+        :raises OmnigentError: The original runner-offline error when no
+            host can answer, or NOT_FOUND for a missing file.
+        :raises HTTPException: On host-reported filesystem failures.
         """
-        from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+        import base64 as _base64
 
-        if host_registry is None or not conversation.host_id or not conversation.workspace:
-            raise OmnigentError(
-                "Session runner is unavailable and no host fallback is configured",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
-        host_conn = host_registry.get(conversation.host_id)
-        if host_conn is None:
-            raise OmnigentError(
-                "Session runner is unavailable and host is not connected",
-                code=ErrorCode.RUNNER_UNAVAILABLE,
-            )
-
-        workspace = conversation.workspace
-        if host_workspace_resolver is not None:
-            workspace = await host_workspace_resolver()
-
+        workspace = (
+            await host_workspace_resolver() if host_workspace_resolver is not None else None
+        )
+        payload = await _read_workspace_via_host(
+            session_id,
+            conversation,
+            "download",
+            {"path": path},
+            workspace_override=workspace,
+        )
+        if payload is None:
+            # No reachable host either — surface the original offline error
+            # (503) so the client shows its reconnect affordance.
+            raise runner_offline
+        filename = str(payload.get("filename") or ntpath.basename(path) or path)
         try:
-            reader = WorkspaceReader(Path(workspace))
-            filename, raw = await asyncio.to_thread(reader.download_bytes, path)
-        except WorkspaceReaderError as exc:
-            if exc.status == 404:
-                raise OmnigentError(exc.message, code=ErrorCode.NOT_FOUND) from exc
-            raise HTTPException(status_code=exc.status, detail=exc.message) from exc
-
+            raw = _base64.b64decode(str(payload.get("content") or ""), validate=True)
+        except (ValueError, TypeError) as exc:
+            raise HTTPException(
+                status_code=502, detail="host returned an invalid download payload"
+            ) from exc
         media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
         return Response(
             content=raw,
